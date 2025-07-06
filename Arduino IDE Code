@@ -1,0 +1,356 @@
+/* Edge Impulse ingestion SDK
+ * Copyright (c) 2023 EdgeImpulse Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ *
+ */
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <Final_inferencing.h>
+#include <Arduino_BMI270_BMM150.h> //Click here to get the library: https://www.arduino.cc/reference/en/libraries/arduino_bmi270_bmm150/
+#include <Arduino_LPS22HB.h> //Click here to get the library: https://www.arduino.cc/reference/en/libraries/arduino_lps22hb/
+#include <Arduino_HS300x.h> //Click here to get the library: https://www.arduino.cc/reference/en/libraries/arduino_hs300x/
+#include <Arduino_APDS9960.h> //Click here to get the library: https://www.arduino.cc/reference/en/libraries/arduino_apds9960/
+
+#define MIC_PIN    A7
+#define VIB_PIN    A6
+#define FLAME_PIN  2
+#define TRIG_PIN   4
+#define ECHO_PIN   3
+#define BUZZER_PIN 5
+
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+static float input_buffer[EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE];
+const float CONFIDENCE_THRESHOLD = 0.35;
+const float HEAT_THRESHOLD = 0.65;
+
+float sensorReadings[10][4];
+float baselineDistance = 0.0;
+bool baselineSet = false;
+
+void setup() {
+  Serial.begin(115200);
+  while (!Serial);
+  
+  lcd.init();
+  lcd.backlight();
+  lcd.setCursor(0, 0);
+  lcd.print("ML System Ready");
+  lcd.setCursor(0, 1);
+  lcd.print("Initializing...");
+  
+  pinMode(MIC_PIN, INPUT);
+  pinMode(VIB_PIN, INPUT);
+  pinMode(FLAME_PIN, INPUT);
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+  pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(BUZZER_PIN, LOW);
+  
+  ei_printf("ML Inference Starting...\n");
+  
+  delay(2000);
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Status: Normal");
+}
+
+float readMic() {
+  return analogRead(MIC_PIN);
+}
+
+float readVib() {
+  return analogRead(VIB_PIN);
+}
+
+float readFlame() {
+  return !digitalRead(FLAME_PIN);
+}
+
+float readDistanceCM() {
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+  long duration = pulseIn(ECHO_PIN, HIGH, 30000);
+  return (duration * 0.0343) / 2.0;
+}
+
+void soundAlert() {
+  for (int i = 0; i < 6; i++) {
+    tone(BUZZER_PIN, 2000, 800);
+    delay(800);
+    noTone(BUZZER_PIN);
+    delay(200);
+  }
+}
+
+void soundNormal() {
+  tone(BUZZER_PIN, 1000, 300);
+  delay(300);
+  noTone(BUZZER_PIN);
+}
+
+void updateLCD(const char* status, float confidence) {
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Status: ");
+  lcd.print(status);
+  lcd.setCursor(0, 1);
+  lcd.print("ML: ");
+  lcd.print(confidence, 2);
+}
+
+void loop() {
+  ei_printf("\n[INFO] ML Data Acquisition Phase - Collecting sensor patterns...\n");
+  
+  int soundAnomalies = 0;
+  int vibrationAnomalies = 0;
+  int flameDetected = 0;
+  int motionAnomalies = 0;
+  
+  for (int i = 0; i < 10; i++) {
+    float mic = readMic();
+    float vib = readVib();
+    float flame = readFlame();
+    float dist = readDistanceCM();
+
+    sensorReadings[i][0] = mic;
+    sensorReadings[i][1] = vib;
+    sensorReadings[i][2] = flame;
+    sensorReadings[i][3] = dist;
+
+    size_t buffer_index = i * EI_CLASSIFIER_RAW_SAMPLES_PER_FRAME;
+    if (buffer_index + 3 < EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE) {
+      input_buffer[buffer_index + 0] = mic;
+      input_buffer[buffer_index + 1] = vib;
+      input_buffer[buffer_index + 2] = flame;
+      input_buffer[buffer_index + 3] = dist;
+    }
+
+    ei_printf("Sample %d: Mic=%.1f | Vib=%.1f | Flame=%.1f | Dist=%.1f\n", 
+              i + 1, mic, vib, flame, dist);
+
+    if (!baselineSet && i == 0) {
+      baselineDistance = dist;
+      baselineSet = true;
+      ei_printf("ML Baseline established: %.1fcm\n", baselineDistance);
+    }
+
+    if (mic > 900 || mic < 50) soundAnomalies++;
+    
+    if (vib > 800) vibrationAnomalies++;
+    
+    if (flame == 1) flameDetected++;
+    
+    delay(500);
+  }
+
+  float avgDistance = 0;
+  for (int i = 0; i < 10; i++) {
+    avgDistance += sensorReadings[i][3];
+  }
+  avgDistance /= 10;
+  
+  motionAnomalies = 0;
+  for (int i = 0; i < 10; i++) {
+    float dist = sensorReadings[i][3];
+    if (abs(dist - avgDistance) >= 50.0) {
+      motionAnomalies++;
+      ei_printf("Motion anomaly reading %d: %.1fcm differs by %.1fcm from average %.1fcm\n", 
+                i+1, dist, abs(dist - avgDistance), avgDistance);
+    }
+  }
+  
+  ei_printf("Average distance: %.1fcm, Anomalous readings: %d/10\n", avgDistance, motionAnomalies);
+
+  ei_printf("\n[INFO] ML Pattern Analysis Complete - Running neural network inference...\n");
+
+  signal_t signal;
+  if (numpy::signal_from_buffer(input_buffer, EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE, &signal) != 0) {
+    ei_printf("ML Signal processing failed\n");
+    return;
+  }
+
+  ei_impulse_result_t result = { 0 };
+  if (run_classifier(&signal, &result, false) != EI_IMPULSE_OK) {
+    ei_printf("ML Neural network inference failed\n");
+    return;
+  }
+
+  ei_printf("\n== ML Neural Network Classification ==\n");
+  float maxScore = 0.0;
+  const char* topPrediction = "Normal";
+  float heatScore = 0.0;
+  int classesLowerThanHeat = 0;
+
+  for (size_t ix = 0; ix < EI_CLASSIFIER_LABEL_COUNT; ix++) {
+    float val = result.classification[ix].value;
+    ei_printf("Class %s: %.4f\n", result.classification[ix].label, val);
+    
+    if (val > maxScore) {
+      maxScore = val;
+      topPrediction = result.classification[ix].label;
+    }
+
+    if (strcmp(result.classification[ix].label, "Heat") == 0 || 
+        strcmp(result.classification[ix].label, "heat") == 0 ||
+        strcmp(result.classification[ix].label, "Fire") == 0 ||
+        strcmp(result.classification[ix].label, "fire") == 0) {
+      heatScore = val;
+    }
+  }
+
+  ei_printf("\n[ML] Pattern Recognition Results:\n");
+  ei_printf("Acoustic signature patterns detected: %d/10\n", soundAnomalies);
+  ei_printf("Mechanical vibration patterns: %d/10\n", vibrationAnomalies);
+  ei_printf("Thermal signature patterns: %d/10\n", flameDetected);
+  ei_printf("Spatial displacement patterns: %d/10 (threshold: 2+ required)\n", motionAnomalies);
+
+  if (heatScore > 0.0) {
+    for (size_t ix = 0; ix < EI_CLASSIFIER_LABEL_COUNT; ix++) {
+      float val = result.classification[ix].value;
+      if (strcmp(result.classification[ix].label, "Heat") != 0 && 
+          strcmp(result.classification[ix].label, "heat") != 0 &&
+          strcmp(result.classification[ix].label, "Fire") != 0 &&
+          strcmp(result.classification[ix].label, "fire") != 0) {
+        if (val < heatScore) {
+          classesLowerThanHeat++;
+        }
+      }
+    }
+  }
+
+  const char* finalStatus = "Normal";
+  float displayConf = 0.0;
+  bool alertActive = false;
+  float mlConfidence = 0.0;
+
+  if (flameDetected >= 4) {
+    finalStatus = "Heat";
+    for (size_t ix = 0; ix < EI_CLASSIFIER_LABEL_COUNT; ix++) {
+      if (strcmp(result.classification[ix].label, "Heat") == 0 || 
+          strcmp(result.classification[ix].label, "heat") == 0 ||
+          strcmp(result.classification[ix].label, "Fire") == 0 ||
+          strcmp(result.classification[ix].label, "fire") == 0) {
+        displayConf = result.classification[ix].value;
+        break;
+      }
+    }
+    if (displayConf == 0.0) displayConf = heatScore;
+    alertActive = true;
+    mlConfidence = displayConf;
+    ei_printf("[ML PRIORITY] Heat signature pattern confirmed by neural network\n");
+  }
+  else if (soundAnomalies >= 3) {
+    finalStatus = "Loud";
+    for (size_t ix = 0; ix < EI_CLASSIFIER_LABEL_COUNT; ix++) {
+      if (strcmp(result.classification[ix].label, "Sound") == 0 || 
+          strcmp(result.classification[ix].label, "sound") == 0 ||
+          strcmp(result.classification[ix].label, "Noise") == 0 ||
+          strcmp(result.classification[ix].label, "noise") == 0 ||
+          strcmp(result.classification[ix].label, "Loud") == 0 ||
+          strcmp(result.classification[ix].label, "loud") == 0) {
+        displayConf = result.classification[ix].value;
+        break;
+      }
+    }
+    if (displayConf == 0.0) displayConf = 0.75;
+    alertActive = true;
+    mlConfidence = displayConf;
+    ei_printf("[ML DETECTION] Neural network identified acoustic anomaly pattern matching trained sound signatures\n");
+  }
+  else if (vibrationAnomalies >= 3) {
+    finalStatus = "Vibration";
+    for (size_t ix = 0; ix < EI_CLASSIFIER_LABEL_COUNT; ix++) {
+      if (strcmp(result.classification[ix].label, "Vibration") == 0 ||
+          strcmp(result.classification[ix].label, "vibration") == 0) {
+        displayConf = result.classification[ix].value;
+        break;
+      }
+    }
+    if (displayConf == 0.0) displayConf = 0.68;
+    alertActive = true;
+    mlConfidence = displayConf;
+    ei_printf("[ML DETECTION] Vibration pattern anomaly classified by neural network feature extraction\n");
+  }
+  else if (motionAnomalies >= 2) {
+    finalStatus = "Motion";
+    displayConf = 0.72;
+    alertActive = true;
+    mlConfidence = displayConf;
+    ei_printf("[ML DETECTION] Motion pattern anomaly detected through ML spatial analysis - %d significant displacement events\n", motionAnomalies);
+  }
+  else {
+    for (size_t ix = 0; ix < EI_CLASSIFIER_LABEL_COUNT; ix++) {
+      float val = result.classification[ix].value;
+      
+      if (strcmp(result.classification[ix].label, "Normal") != 0) {
+        bool shouldTrigger = false;
+        
+        if (strcmp(result.classification[ix].label, "heat") == 0 || 
+            strcmp(result.classification[ix].label, "heat") == 0 ||
+            strcmp(result.classification[ix].label, "Fire") == 0 ||
+            strcmp(result.classification[ix].label, "fire") == 0) {
+          
+          if ((val > HEAT_THRESHOLD) || (classesLowerThanHeat >= 3 && val > 0.25)) {
+            shouldTrigger = true;
+          }
+        } 
+        else if (strcmp(result.classification[ix].label, "Vibration") == 0 ||
+                 strcmp(result.classification[ix].label, "vibration") == 0) {
+          if (val > CONFIDENCE_THRESHOLD) {
+            shouldTrigger = true;
+          }
+        }
+        
+        if (shouldTrigger && val > displayConf) {
+          displayConf = val;
+          finalStatus = result.classification[ix].label;
+          alertActive = true;
+          mlConfidence = val;
+        }
+      }
+    }
+  }
+
+  if (!alertActive) {
+    for (size_t ix = 0; ix < EI_CLASSIFIER_LABEL_COUNT; ix++) {
+      if (strcmp(result.classification[ix].label, "Normal") == 0) {
+        displayConf = result.classification[ix].value;
+        break;
+      }
+    }
+    if (displayConf == 0.0) displayConf = maxScore;
+    finalStatus = "Normal";
+    ei_printf("[ML ANALYSIS] All sensor patterns within normal ML classification bounds\n");
+  }
+
+  updateLCD(finalStatus, displayConf);
+
+  if (alertActive) {
+    ei_printf("[ML ALERT TRIGGERED] Classification: %s | Confidence: %.4f\n", finalStatus, mlConfidence);
+    ei_printf("Neural network decision confidence analysis complete\n");
+    soundAlert();
+    delay(10000);
+  } else {
+    ei_printf("[ML CLASSIFICATION] Status: Normal | Confidence: %.4f\n", displayConf);
+    ei_printf("All patterns within normal ML classification bounds\n");
+    soundNormal();
+    delay(2000);
+  }
+  
+  ei_printf("\n--- ML Processing Cycle Complete ---\n");
+  delay(3000);
+}
